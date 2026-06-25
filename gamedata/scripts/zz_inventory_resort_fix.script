@@ -1,0 +1,149 @@
+-- zz_inventory_resort_fix.script
+-- Fixes modified/moved items landing at the very end of the inventory instead
+-- of their correct sorted position. Works for both sides of loot and trade UIs.
+--
+-- Root cause: *Mode_RefreshInventories and TransferItem both use incremental
+-- AddItem which calls FindFreeCell with stale rKind state (row_end + 1).
+-- Fix: schedule a full Reinit next tick, preserving scroll position.
+--
+-- Trade bags require extra care: ParseInventory(npc) returns ALL NPC items
+-- including those already in the purchase basket (npc_trade), so after Reinit
+-- we strip out basket items to avoid duplicates.
+
+-- ── helper: inventory / loot modes ───────────────────────────────────────────
+-- Snapshots item IDs before the refresh; if any new ID appears afterward,
+-- schedules a Reinit + scroll restore on the next engine tick.
+local function resort_if_added(self, cc, timer_key, parse_fn)
+    local before = {}
+    for id in pairs(cc.indx_id) do before[id] = true end
+
+    return function()
+        for id in pairs(cc.indx_id) do
+            if not before[id] then
+                CreateTimeEvent("inv_resort_" .. timer_key, "inv_resort_" .. timer_key, 0, function()
+                    if self:IsShown() then
+                        local saved_pos = cc.scroll:GetCurrentScrollPos()
+                        cc:Reinit(parse_fn())
+                        cc:Scroll_SetPos(saved_pos, true)
+                    end
+                    return true
+                end)
+                return
+            end
+        end
+    end
+end
+
+-- ── helper: trade bags ────────────────────────────────────────────────────────
+-- Reinits a trade bag then removes items still in the counterpart basket so
+-- they don't appear in both places simultaneously.
+local function resort_trade_bag(self, cc_bag, cc_basket, parse_fn, timer_key)
+    CreateTimeEvent("inv_resort_" .. timer_key, "inv_resort_" .. timer_key, 0, function()
+        if self:IsShown() then
+            local basket_ids = {}
+            for id in pairs(cc_basket.indx_id) do basket_ids[id] = true end
+
+            local saved_pos = cc_bag.scroll:GetCurrentScrollPos()
+            cc_bag:Reinit(parse_fn())
+            for id in pairs(basket_ids) do
+                cc_bag:RemoveItem_byID(id)
+            end
+            cc_bag:Scroll_SetPos(saved_pos, true)
+        end
+        return true
+    end)
+end
+
+-- ── IMode (inventory / repair) ───────────────────────────────────────────────
+local orig_IMode_Refresh = ui_inventory.UIInventory.IMode_RefreshInventories
+function ui_inventory.UIInventory:IMode_RefreshInventories()
+    local check = resort_if_added(self, self.CC["actor_bag"], "actor",
+        function() return self:ParseInventory(db.actor) end)
+    orig_IMode_Refresh(self)
+    check()
+end
+
+-- ── LMode (chests, stashes, corpses) ─────────────────────────────────────────
+local orig_LMode_Refresh = ui_inventory.UIInventory.LMode_RefreshInventories
+function ui_inventory.UIInventory:LMode_RefreshInventories()
+    local check_a = resort_if_added(self, self.CC["actor_bag"], "actor",
+        function() return self:ParseInventory(db.actor) end)
+
+    local check_b = resort_if_added(self, self.CC["npc_bag"], "npc",
+        function()
+            local npc = self:GetPartner()
+            if not npc then return {} end
+            if self.npc_is_companion then
+                return self:ParseInventory_Companion(npc)
+            end
+            local is_box = IsInvbox(npc)
+            local all = (not is_box) and (not npc:alive())
+            return self:ParseInventory(npc, all)
+        end)
+
+    orig_LMode_Refresh(self)
+    check_a()
+    check_b()
+end
+
+-- ── TMode: external additions (repairs / crafting while window is open) ───────
+-- TransferItem-driven moves are handled by the Action_Move patch below.
+local orig_TMode_Refresh = ui_inventory.UIInventory.TMode_RefreshInventories
+function ui_inventory.UIInventory:TMode_RefreshInventories()
+    local cc_a  = self.CC["actor_trade_bag"]
+    local cc_at = self.CC["actor_trade"]
+    local cc_b  = self.CC["npc_trade_bag"]
+    local cc_bt = self.CC["npc_trade"]
+
+    local before_a, before_b = {}, {}
+    for id in pairs(cc_a.indx_id) do before_a[id] = true end
+    for id in pairs(cc_b.indx_id) do before_b[id] = true end
+
+    orig_TMode_Refresh(self)
+
+    for id in pairs(cc_a.indx_id) do
+        if not before_a[id] then
+            resort_trade_bag(self, cc_a, cc_at,
+                function() return self:ParseInventory(db.actor) end,
+                "actor_trade")
+            break
+        end
+    end
+
+    for id in pairs(cc_b.indx_id) do
+        if not before_b[id] then
+            resort_trade_bag(self, cc_b, cc_bt,
+                function()
+                    local npc = self:GetPartner()
+                    return npc and self:ParseInventory(npc) or {}
+                end,
+                "npc_trade")
+            break
+        end
+    end
+end
+
+-- ── TMode: basket ↔ bag double-click transfers ────────────────────────────────
+-- When an item is double-clicked from npc_trade/actor_trade back to the bag,
+-- TransferItem adds it via AddItem with stale rKind before any refresh runs.
+-- Patch Action_Move to schedule a resort of the destination bag immediately.
+local orig_Action_Move = ui_inventory.UIInventory.Action_Move
+function ui_inventory.UIInventory:Action_Move(obj, bag)
+    orig_Action_Move(self, obj, bag)
+
+    if self.mode ~= "trade" then return end
+
+    if bag == "npc_trade" then
+        resort_trade_bag(self, self.CC["npc_trade_bag"], self.CC["npc_trade"],
+            function()
+                local npc = self:GetPartner()
+                return npc and self:ParseInventory(npc) or {}
+            end,
+            "npc_trade_bag")
+
+    elseif bag == "actor_trade" then
+        resort_trade_bag(self, self.CC["actor_trade_bag"], self.CC["actor_trade"],
+            function() return self:ParseInventory(db.actor) end,
+            "actor_trade_bag")
+    end
+end
