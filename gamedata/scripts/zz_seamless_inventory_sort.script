@@ -1,4 +1,4 @@
--- zz_gun_resort_fix.script
+-- zz_seamless_inventory_sort.script
 --
 -- Keeps inventory containers sorted whenever an item lands in one out of order:
 --   * modifying a gun (attach/detach scope/holo/silencer/GL, unload a mag, any
@@ -25,8 +25,14 @@
 -- and do a single re-sort once shift is released. Shift is read with key_state,
 -- exactly like FastTransfer, so left AND right shift both work.
 --
--- The trade screen is never touched: its panels are actor_trade(_bag) /
--- npc_trade(_bag), and actor_bag / npc_bag are not shown during trade.
+-- Containers handled:
+--   * actor_bag / npc_bag       -- inventory & loot/stash (soft, Reinit fallback)
+--   * actor_trade_bag / npc_trade_bag -- the two trade SALE BAGS, SOFT-ONLY.
+--     The trade BASKETS (actor_trade / npc_trade) are left alone, and trade
+--     containers are NEVER Reinit'd: a Reinit rebuilds from ParseInventory,
+--     which re-adds basketed items (still in the ruck) into the sale bag -- the
+--     classic duplicate / stuck-in-basket bug. soft_resort only repositions
+--     existing cells, so it cannot reintroduce that.
 
 local seax = seax_sortingplus_opt_sort_by_kind  -- SeaX sort factory (optional)
 
@@ -101,9 +107,19 @@ end
 
 -- Perform the actual re-sort (soft in place; Reinit fallback) and record the
 -- sorted fingerprint so we will not re-sort the same layout again.
-local function resort_now(self, cc, key, parse_fn)
+--
+-- soft_only (trade bags): NEVER Reinit. A trade-container Reinit rebuilds from
+-- ParseInventory(npc), which re-adds basketed items (still in the ruck until the
+-- deal is confirmed) back into the sale bag -- the old duplicate / stuck-in-
+-- basket bug. soft_resort only repositions existing cells, so it cannot do that;
+-- if soft cannot run we simply leave the order as-is.
+local function resort_now(self, cc, key, parse_fn, soft_only)
     if can_soft(cc) and pcall(soft_resort, cc) then
         last_fp[key] = fingerprint(cc)
+        return
+    end
+    if soft_only then
+        last_fp[key] = fingerprint(cc)  -- mark handled, skip (no Reinit)
         return
     end
     cc:Reinit(parse_fn())
@@ -111,7 +127,7 @@ local function resort_now(self, cc, key, parse_fn)
 end
 
 -- While shift is held (bulk transfer), wait; re-sort once when it is released.
-local function arm_release(self, cc, key, parse_fn)
+local function arm_release(self, cc, key, parse_fn, soft_only)
     if rel_armed[key] then
         return
     end
@@ -126,7 +142,7 @@ local function arm_release(self, cc, key, parse_fn)
         if not shift_held() then
             if fingerprint(cc) ~= (last_fp[key] or -1) then
                 local pos = cc.scroll:GetCurrentScrollPos()
-                resort_now(self, cc, key, parse_fn)
+                resort_now(self, cc, key, parse_fn, soft_only)
                 cc:Scroll_SetPos(pos, true)
             end
             rel_armed[key] = false
@@ -138,7 +154,7 @@ end
 
 -- Called right after a stock refresh. Re-sorts the container if it changed,
 -- deferring while shift is held. saved_pos = scroll position before the refresh.
-local function handle(self, cc, key, parse_fn, saved_pos)
+local function handle(self, cc, key, parse_fn, saved_pos, soft_only)
     if not (cc and cc:IsShown()) then
         return
     end
@@ -146,10 +162,10 @@ local function handle(self, cc, key, parse_fn, saved_pos)
         return  -- nothing changed since last sort
     end
     if shift_held() then
-        arm_release(self, cc, key, parse_fn)  -- bulk: defer to shift release
+        arm_release(self, cc, key, parse_fn, soft_only)  -- bulk: defer to release
         return
     end
-    resort_now(self, cc, key, parse_fn)
+    resort_now(self, cc, key, parse_fn, soft_only)
     if saved_pos then
         cc:Scroll_SetPos(saved_pos, true)
     end
@@ -193,4 +209,17 @@ function ui_inventory.UIInventory:LMode_RefreshInventories()
     orig_LMode(self)
     handle(self, cc_a, "actor", function() return self:ParseInventory(db.actor) end, sp_a)
     handle(self, cc_b, "npc",   function() return parse_container(self) end,        sp_b)
+end
+
+-- Trade: re-sort the two SALE BAGS only (not the baskets), and SOFT-ONLY -- a
+-- trade-container Reinit would re-add basketed items into the sale bag.
+local orig_TMode = ui_inventory.UIInventory.TMode_RefreshInventories
+function ui_inventory.UIInventory:TMode_RefreshInventories()
+    local cc_a = self.CC["actor_trade_bag"]
+    local cc_b = self.CC["npc_trade_bag"]
+    local sp_a = scroll_pos(cc_a)
+    local sp_b = scroll_pos(cc_b)
+    orig_TMode(self)
+    handle(self, cc_a, "actor_tbag", nil, sp_a, true)
+    handle(self, cc_b, "npc_tbag",   nil, sp_b, true)
 end
