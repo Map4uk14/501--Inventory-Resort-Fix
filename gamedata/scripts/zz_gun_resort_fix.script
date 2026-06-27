@@ -1,0 +1,196 @@
+-- zz_gun_resort_fix.script
+--
+-- Keeps inventory containers sorted whenever an item lands in one out of order:
+--   * modifying a gun (attach/detach scope/holo/silencer/GL, unload a mag, any
+--     "use" action) makes the engine respawn the weapon as a new object that
+--     gets appended to the END of the list;
+--   * moving an item between the player bag and a loot/stash/container drops it
+--     at the END of the destination instead of its sorted row.
+--
+-- We hook the inventory REFRESH functions (IMode_/LMode_RefreshInventories) and
+-- re-sort right after the stock refresh runs -- i.e. in the SAME frame the item
+-- is added, before it is drawn. That is what makes it seamless: the item never
+-- gets a chance to render at the end of the list (this is what fixes the
+-- holographic-sight "flick to the end and back", whose weapon respawns a couple
+-- frames after the detach).
+--
+-- Re-sort is done by soft_resort: it REPOSITIONS the existing cells into their
+-- sorted slots with Set() (no Reset/Show(false) blink, stacked-item children
+-- left intact, no add/remove so loot-box put/take callbacks are not tripped).
+-- A last-sorted fingerprint guard means we only re-sort when the layout actually
+-- changed, so a container Reinit fallback cannot loop.
+--
+-- Bulk stashing (Ishmaeel FastTransfer = sweep with SHIFT held): re-sorting on
+-- every one of dozens of rapid moves is slow, so while shift is held we DEFER
+-- and do a single re-sort once shift is released. Shift is read with key_state,
+-- exactly like FastTransfer, so left AND right shift both work.
+--
+-- The trade screen is never touched: its panels are actor_trade(_bag) /
+-- npc_trade(_bag), and actor_bag / npc_bag are not shown during trade.
+
+local seax = seax_sortingplus_opt_sort_by_kind  -- SeaX sort factory (optional)
+
+local last_fp   = {}  -- key -> fingerprint at last sort ("already sorted" guard)
+local rel_armed = {}  -- key -> a shift-release watcher is running
+
+local function shift_held()
+    return (key_state(DIK_keys.DIK_LSHIFT) ~= 0) or (key_state(DIK_keys.DIK_RSHIFT) ~= 0)
+end
+
+-- Position-aware fingerprint: changes if any id is added, removed, OR moved to
+-- a different cell index. (Sum over id<->indx pairs; order-independent.)
+local function fingerprint(cc)
+    local h = 0
+    for id, indx in pairs(cc.indx_id) do
+        h = h + id + indx * 1000003
+    end
+    return h
+end
+
+-- True when we can re-sort a container in place (SeaX present + kind sorting).
+local function can_soft(cc)
+    return seax and seax.sort_by_kind_factory and spairs and (cc.sort_method == "kind")
+end
+
+-- Re-sort by moving existing cells into their sorted slots: no Reset, no blink,
+-- children preserved, no item add/remove.
+local function soft_resort(cc)
+    -- collect the parent cells (children ride inside their parent cell)
+    local items   = {}
+    local cell_of = {}
+    for id, idx in pairs(cc.indx_id) do
+        local ci = cc.cell[idx]
+        if ci and (ci.ID == id) then
+            local obj = level.object_by_id(id)
+            if obj and obj:section() then
+                items[#items + 1] = obj
+                cell_of[id] = ci
+            end
+        end
+    end
+    if #items == 0 then
+        return
+    end
+
+    -- reset ONLY the grid-packing bookkeeping; cells/contents/children are kept
+    for row, cols in pairs(cc.grid) do
+        for col in pairs(cols) do
+            cc.grid[row][col] = true
+        end
+    end
+    cc.row_end       = 0
+    cc.col_end       = 0
+    cc.rKind.last    = false
+    cc.rKind.current = false
+    cc.rKind.row     = 1
+
+    -- place each item in sorted order, moving its existing cell to the slot
+    local cmp, find_free = seax.sort_by_kind_factory(items)
+    local saved_find = cc.FindFreeCell
+    cc.FindFreeCell = find_free
+    for _, obj in spairs(items, cmp) do
+        local area = cc:FindFreeCell(obj, obj:section())
+        if area then
+            cell_of[obj:id()]:Set(obj, area)  -- reposition only, no blink
+        end
+    end
+    cc.FindFreeCell = saved_find
+
+    cc:Scroll_Reinit(true)
+end
+
+-- Perform the actual re-sort (soft in place; Reinit fallback) and record the
+-- sorted fingerprint so we will not re-sort the same layout again.
+local function resort_now(self, cc, key, parse_fn)
+    if can_soft(cc) and pcall(soft_resort, cc) then
+        last_fp[key] = fingerprint(cc)
+        return
+    end
+    cc:Reinit(parse_fn())
+    last_fp[key] = fingerprint(cc)
+end
+
+-- While shift is held (bulk transfer), wait; re-sort once when it is released.
+local function arm_release(self, cc, key, parse_fn)
+    if rel_armed[key] then
+        return
+    end
+    rel_armed[key] = true
+    local tries = 0
+    CreateTimeEvent("gun_resort_rel_" .. key, "gun_resort_rel_" .. key, 0, function()
+        tries = tries + 1
+        if (not cc:IsShown()) or (tries >= 1800) then
+            rel_armed[key] = false
+            return true
+        end
+        if not shift_held() then
+            if fingerprint(cc) ~= (last_fp[key] or -1) then
+                local pos = cc.scroll:GetCurrentScrollPos()
+                resort_now(self, cc, key, parse_fn)
+                cc:Scroll_SetPos(pos, true)
+            end
+            rel_armed[key] = false
+            return true
+        end
+        return false  -- keep waiting while shift held
+    end)
+end
+
+-- Called right after a stock refresh. Re-sorts the container if it changed,
+-- deferring while shift is held. saved_pos = scroll position before the refresh.
+local function handle(self, cc, key, parse_fn, saved_pos)
+    if not (cc and cc:IsShown()) then
+        return
+    end
+    if fingerprint(cc) == (last_fp[key] or -1) then
+        return  -- nothing changed since last sort
+    end
+    if shift_held() then
+        arm_release(self, cc, key, parse_fn)  -- bulk: defer to shift release
+        return
+    end
+    resort_now(self, cc, key, parse_fn)
+    if saved_pos then
+        cc:Scroll_SetPos(saved_pos, true)
+    end
+end
+
+-- Item list the game uses for the loot/stash/container side (npc_bag).
+local function parse_container(self)
+    local npc = self:GetPartner()
+    if not npc then
+        return {}
+    end
+    if self.npc_is_companion then
+        return self:ParseInventory_Companion(npc)
+    end
+    local is_box = IsInvbox(npc)
+    local all = (not is_box) and (not npc:alive())
+    return self:ParseInventory(npc, all)
+end
+
+local function scroll_pos(cc)
+    if cc and cc:IsShown() then
+        return cc.scroll:GetCurrentScrollPos()
+    end
+end
+
+-- Hook the refreshes: capture scroll, run stock refresh, then re-sort same frame.
+local orig_IMode = ui_inventory.UIInventory.IMode_RefreshInventories
+function ui_inventory.UIInventory:IMode_RefreshInventories()
+    local cc_a = self.CC["actor_bag"]
+    local sp_a = scroll_pos(cc_a)
+    orig_IMode(self)
+    handle(self, cc_a, "actor", function() return self:ParseInventory(db.actor) end, sp_a)
+end
+
+local orig_LMode = ui_inventory.UIInventory.LMode_RefreshInventories
+function ui_inventory.UIInventory:LMode_RefreshInventories()
+    local cc_a = self.CC["actor_bag"]
+    local cc_b = self.CC["npc_bag"]
+    local sp_a = scroll_pos(cc_a)
+    local sp_b = scroll_pos(cc_b)
+    orig_LMode(self)
+    handle(self, cc_a, "actor", function() return self:ParseInventory(db.actor) end, sp_a)
+    handle(self, cc_b, "npc",   function() return parse_container(self) end,        sp_b)
+end
