@@ -19,6 +19,8 @@ All of these previously caused the "jumps to the end" behaviour:
 - Moving items into or out of a stash, chest, corpse, or companion
 - Buying / selling at a trader
 
+It also fixes **marking an item favorite or junk** (SortingPlus' `K` / `J` keys or the right-click menu): the item now snaps to the top (favorite) or bottom (junk) instantly, in place — previously it stayed put until you reopened the window, or did a full-rebuild flicker.
+
 ### Works in Every Inventory Window
 
 | Window | Coverage |
@@ -35,9 +37,9 @@ All of these previously caused the "jumps to the end" behaviour:
 
 - **G.A.M.M.A. RC3** (or Anomaly) with:
   - [SortingPlus](https://github.com/RavenAscendant) by RavenAscendant — **GAMMA mod 110** *(required)*
-  - Inventory Open Lag Reducer by sea-ex — **GAMMA mod 464** *(recommended)*
+  - Inventory Open Lag Reducer by sea-ex — **GAMMA mod 464** *(optional, recommended)*
 
-> The seamless in-place sort reuses mod 464's optimized sort. Without it, inventory and loot windows fall back to a full rebuild (still correct, just a slight visible refresh) and the trade window is left unsorted for safety. All three are included and enabled by default in G.A.M.M.A. RC3.
+> SortingPlus is the only hard requirement — its "kind" sort is what this mod keeps tidy. Mod 464 is purely a speed-up: when present, its faster precomputed sort is used; when absent, SortingPlus' own comparator is used instead — either way the re-sort is seamless and in place. If neither can run (SortingPlus inactive, or a window set to sort by size), the order is simply left untouched and items land at the end like vanilla — no rebuild, no flicker, no performance cost. Both 110 and 464 are included and enabled by default in G.A.M.M.A. RC3.
 
 ---
 
@@ -58,13 +60,15 @@ SortingPlus places items by "kind" using an `rKind` row tracker. When the stock 
 
 This mod hooks `IMode_`, `LMode_`, and `TMode_RefreshInventories`. Right after the stock refresh runs — in the **same frame**, before the UI draws — it re-sorts the affected container so the item never renders at the end. This is what makes it seamless, including the holographic sight's two-stage weapon respawn.
 
-The re-sort (`soft_resort`) does **not** rebuild the container. It **repositions** existing cells into their sorted slots via `UICellItem:Set(area)`, reusing SeaX's kind comparator + cell placement. Because nothing is added or removed:
+The re-sort (`soft_resort`) does **not** rebuild the container. It **repositions** existing cells into their sorted slots via `UICellItem:Set(area)`, reusing the sea-ex fast comparator when mod 464 is present and SortingPlus' own comparator otherwise. Because nothing is added or removed:
 
 - There is no `Reset()`/`Show(false)` blink, even on huge stashes
 - Stacked-item children are left intact
 - Loot-box put/take callbacks are not re-fired (no rebuild feedback loop)
 
 A position-aware fingerprint guards against redundant re-sorts.
+
+**Favorite / junk** toggles are handled separately: they change an item's sort order without moving any cell, so the refresh hooks never see a layout change. SortingPlus signals them through `rax_icon_layers.refresh`, which this mod hooks to run the same `soft_resort` (unconditionally, since the fingerprint is unchanged) — replacing SortingPlus' stock full-rebuild `On_Sort` with the seamless in-place re-sort.
 
 **Trade is SOFT-ONLY** — trade containers are never `Reinit`'d. A trade `Reinit` would rebuild from `ParseInventory(npc)`, which still contains basketed items (they stay in the ruck until the deal is confirmed) and would re-add them to the sale bag, causing the classic duplicate / stuck-in-basket bug. Repositioning cannot do that, so it is safe.
 

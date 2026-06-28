@@ -25,6 +25,13 @@
 -- and do a single re-sort once shift is released. Shift is read with key_state,
 -- exactly like FastTransfer, so left AND right shift both work.
 --
+-- Marking an item favorite/junk (SortingPlus' K / J keys or the right-click
+-- menu) changes its sort order but moves no cell, so the refresh hooks above
+-- never see a layout change. SortingPlus signals these toggles through
+-- rax_icon_layers.refresh; we hook that and run the SAME seamless soft_resort,
+-- so favorites jump to the top and junk to the bottom in place -- without the
+-- full-rebuild blink the stock RESORT path causes.
+--
 -- Containers handled:
 --   * actor_bag / npc_bag       -- inventory & loot/stash (soft, Reinit fallback)
 --   * actor_trade_bag / npc_trade_bag -- the two trade SALE BAGS, SOFT-ONLY.
@@ -33,8 +40,6 @@
 --     which re-adds basketed items (still in the ruck) into the sale bag -- the
 --     classic duplicate / stuck-in-basket bug. soft_resort only repositions
 --     existing cells, so it cannot reintroduce that.
-
-local seax = seax_sortingplus_opt_sort_by_kind  -- SeaX sort factory (optional)
 
 local last_fp   = {}  -- key -> fingerprint at last sort ("already sorted" guard)
 local rel_armed = {}  -- key -> a shift-release watcher is running
@@ -53,9 +58,11 @@ local function fingerprint(cc)
     return h
 end
 
--- True when we can re-sort a container in place (SeaX present + kind sorting).
+-- True when we can re-sort a container in place. Needs only SortingPlus: a
+-- "kind"-sorted container means SortingPlus is active, so GetSortMethod() returns
+-- its sort_by_kind comparator and the default FindFreeCell is its kind-aware one.
 local function can_soft(cc)
-    return seax and seax.sort_by_kind_factory and spairs and (cc.sort_method == "kind")
+    return spairs and cc.GetSortMethod and (cc.sort_method == "kind")
 end
 
 -- Re-sort by moving existing cells into their sorted slots: no Reset, no blink,
@@ -90,10 +97,23 @@ local function soft_resort(cc)
     cc.rKind.current = false
     cc.rKind.row     = 1
 
-    -- place each item in sorted order, moving its existing cell to the slot
-    local cmp, find_free = seax.sort_by_kind_factory(items)
+    -- Choose the sort. If SeaX's "Inventory Open Lag Reducer" (mod 464) is
+    -- installed, use its fast precomputed factory -- optimized for large
+    -- inventories (credit: sea-ex). Otherwise use SortingPlus's own comparator
+    -- via GetSortMethod(). Either way, sorting builds the kind data and we place
+    -- each item with the matching kind-aware FindFreeCell (reads that data +
+    -- rKind). This is the stock Reinit flow minus the Reset, so the result
+    -- matches the on-open sort. SeaX is optional; SortingPlus alone is enough.
+    local seax = seax_sortingplus_opt_sort_by_kind
+    local cmp, find_free
+    if seax and seax.sort_by_kind_factory then
+        cmp, find_free = seax.sort_by_kind_factory(items)  -- fast path (sea-ex)
+    else
+        cmp = cc:GetSortMethod()                           -- SortingPlus-native
+    end
+
     local saved_find = cc.FindFreeCell
-    cc.FindFreeCell = find_free
+    if find_free then cc.FindFreeCell = find_free end
     for _, obj in spairs(items, cmp) do
         local area = cc:FindFreeCell(obj, obj:section())
         if area then
@@ -105,25 +125,25 @@ local function soft_resort(cc)
     cc:Scroll_Reinit(true)
 end
 
--- Perform the actual re-sort (soft in place; Reinit fallback) and record the
--- sorted fingerprint so we will not re-sort the same layout again.
+-- Perform the actual re-sort (soft in place only) and record the sorted
+-- fingerprint so we will not re-sort the same layout again.
 --
--- soft_only (trade bags): NEVER Reinit. A trade-container Reinit rebuilds from
--- ParseInventory(npc), which re-adds basketed items (still in the ruck until the
--- deal is confirmed) back into the sale bag -- the old duplicate / stuck-in-
--- basket bug. soft_resort only repositions existing cells, so it cannot do that;
--- if soft cannot run we simply leave the order as-is.
+-- SOFT-ONLY BY DESIGN -- we never fall back to a full Reinit. A Reinit rebuild
+-- (Reset + re-add every cell) is expensive and, on a large loot container such
+-- as a corpse or stash, visibly churns the list and tanks FPS. If the in-place
+-- sort cannot run (no SortingPlus, or the window is sorted by "sizekind" instead
+-- of "kind"), we simply leave the order untouched -- items land at the end like
+-- vanilla, with no churn and no performance cost. SortingPlus is the only hard
+-- requirement (SeaX / mod 464 is optional and no longer needed).
+--
+-- (Avoiding Reinit is doubly important for trade: a trade-container Reinit would
+-- rebuild from ParseInventory(npc), re-adding basketed items into the sale bag
+-- -- the old duplicate / stuck-in-basket bug. soft_resort cannot do that.)
 local function resort_now(self, cc, key, parse_fn, soft_only)
-    if can_soft(cc) and pcall(soft_resort, cc) then
-        last_fp[key] = fingerprint(cc)
-        return
+    if can_soft(cc) then
+        pcall(soft_resort, cc)
     end
-    if soft_only then
-        last_fp[key] = fingerprint(cc)  -- mark handled, skip (no Reinit)
-        return
-    end
-    cc:Reinit(parse_fn())
-    last_fp[key] = fingerprint(cc)
+    last_fp[key] = fingerprint(cc)  -- record layout; if soft could not run, skip
 end
 
 -- While shift is held (bulk transfer), wait; re-sort once when it is released.
@@ -222,4 +242,66 @@ function ui_inventory.UIInventory:TMode_RefreshInventories()
     orig_TMode(self)
     handle(self, cc_a, "actor_tbag", nil, sp_a, true)
     handle(self, cc_b, "npc_tbag",   nil, sp_b, true)
+end
+
+-- Favorite / junk toggle hook --------------------------------------------------
+--
+-- The four containers we may re-sort, paired with the fingerprint key used for
+-- each (same keys the refresh hooks above use, so the "already sorted" guard
+-- stays consistent).
+local FAV_CONTAINERS = {
+    { "actor_bag",       "actor"      },
+    { "npc_bag",         "npc"        },
+    { "actor_trade_bag", "actor_tbag" },
+    { "npc_trade_bag",   "npc_tbag"   },
+}
+
+-- Re-sort every shown, sortable container in place. Used for favorite/junk
+-- toggles: those change the sort order WITHOUT moving any cell, so the
+-- fingerprint guard in handle() would skip them -- here we sort unconditionally.
+-- Returns true if we handled the refresh (so the caller can skip the stock,
+-- blink-inducing On_Sort rebuild). All re-sorts are soft, including trade.
+local function resort_all_shown(self)
+    -- Bail out (let the stock path run) unless at least one shown container can
+    -- be sorted in place -- e.g. SortingPlus inactive or window sorted by size.
+    local target = false
+    for _, c in ipairs(FAV_CONTAINERS) do
+        local cc = self.CC[c[1]]
+        if cc and cc:IsShown() and can_soft(cc) then
+            target = true
+            break
+        end
+    end
+    if not target then
+        return false
+    end
+
+    self:UnHighlight_All()
+    self:UpdateItems()  -- redraw the favorite highlight / junk corner icon
+    for _, c in ipairs(FAV_CONTAINERS) do
+        local cc = self.CC[c[1]]
+        if cc and cc:IsShown() and can_soft(cc) then
+            local pos = cc.scroll:GetCurrentScrollPos()
+            resort_now(self, cc, c[2])
+            cc:Scroll_SetPos(pos, true)
+        end
+    end
+    return true
+end
+
+-- SortingPlus calls rax_icon_layers.refresh(RESORT and 1) on every fav/junk
+-- toggle: mode == 1 (RESORT on) means "re-sort", which stock does via a full
+-- On_Sort rebuild (blink). We intercept that and do a seamless soft re-sort
+-- instead. mode == nil (RESORT off) is icon-only -- left to the stock path.
+if rax_icon_layers and rax_icon_layers.refresh then
+    local orig_refresh = rax_icon_layers.refresh
+    function rax_icon_layers.refresh(mode)
+        if mode == 1 then
+            local self = GetActorMenu()
+            if self and resort_all_shown(self) then
+                return  -- reordered in place; skip the stock rebuild
+            end
+        end
+        return orig_refresh(mode)
+    end
 end
