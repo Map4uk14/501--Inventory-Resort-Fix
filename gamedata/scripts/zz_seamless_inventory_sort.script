@@ -324,15 +324,22 @@ local function soft_resort(cc)
         cmp = cc:GetSortMethod()
     end
 
+    -- Swap in the kind-aware FindFreeCell, but ALWAYS restore it -- even if the
+    -- placement loop errors. Leaving the engine's FindFreeCell pointing at the
+    -- temporary seax closure (whose caches only cover this item set) would make
+    -- the next stock refresh crash with a nil-width compare.
     local saved_find = cc.FindFreeCell
     if find_free then cc.FindFreeCell = find_free end
-    for _, obj in spairs(items, cmp) do
-        local area = cc:FindFreeCell(obj, obj:section())
-        if area then
-            cell_of[obj:id()]:Set(obj, area)
+    local ok = pcall(function()
+        for _, obj in spairs(items, cmp) do
+            local area = cc:FindFreeCell(obj, obj:section())
+            if area then
+                cell_of[obj:id()]:Set(obj, area)
+            end
         end
-    end
+    end)
     cc.FindFreeCell = saved_find
+    if not ok then return end
 
     cc:Scroll_Reinit(true)
 end
